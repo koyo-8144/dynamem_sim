@@ -38,7 +38,7 @@ from stretch.llms import (
 # sys.path.append("/home/koyo/stretch_ai/src/stretch/dynamem_sim")
 from dynamem_task_test import DynamemTaskExecutorTest
 from dummy_stretch_client_test import DummyStretchClientTest
-from sim_robot_client import SimRobotClient
+from dynamem_ros2_client import DynaMemROS2Client
 
 
 @click.command()
@@ -166,7 +166,8 @@ def main(
     print("- Create robot client")
     # ZMQ client spawns threads and starts receiving obs + state from the ROS2 bridge.
     # robot = HomeRobotZmqClient(robot_ip=robot_ip)
-    robot = DummyStretchClientTest()
+    # robot = DummyStretchClientTest()
+    robot = DynaMemROS2Client()
     print("robot: ", robot)
 
     print("- Create task executor")
