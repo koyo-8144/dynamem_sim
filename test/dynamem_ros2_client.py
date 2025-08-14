@@ -26,15 +26,15 @@ from stretch.core import AbstractRobotClient
 from stretch.motion import Footprint, RobotModel
 # from stretch.motion.kinematics import HelloStretchKinematics
 from stretch.utils.geometry import xyt_base_to_global
-from stretch.visualization.rerun import RerunVisualizer
+# from stretch.visualization.rerun import RerunVisualizer
 import timeit
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy, QoSHistoryPolicy
 from tf2_ros import TransformBroadcaster, Buffer, TransformListener
 from rclpy.duration import Duration
 from tf2_ros import TransformException
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 from rclpy.qos_event import SubscriptionEventCallbacks
 
+from rerun_ros2_test import RerunVisualizer
 
 
 class DynaMemROS2Client(AbstractRobotClient, Node):
@@ -79,62 +79,91 @@ class DynaMemROS2Client(AbstractRobotClient, Node):
         self._joint_cmd_pub = self.create_publisher(Float64MultiArray, '/joint_pose_cmd', 10)
         self._goal_pose_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
         
-
-        qos_profile = QoSProfile(
-            depth=10,
+        # Common BEST_EFFORT profile for camera topics (matches all publishers)
+        camera_qos = QoSProfile(
+            depth=1,  # Matches all camera publishers
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            durability=QoSDurabilityPolicy.VOLATILE
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST
+        )
+
+        # For /odom (matches publisher exactly)
+        odom_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST
+        )
+
+        # For /joint_states (matches publisher exactly)
+        joint_qos = QoSProfile(
+            depth=10,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST
         )
 
         self.create_subscription(
             Image,
             '/camera/color/image_raw',
             self._color_image_callback,
-            qos_profile=qos_profile
+            qos_profile=camera_qos
         )
         
         self.create_subscription(
             Image,
             '/camera/depth/image_rect_raw',
             self._depth_image_callback,
-            qos_profile=qos_profile
+            qos_profile=camera_qos
         )
         
         self.create_subscription(
             CameraInfo,
             '/camera/color/camera_info',
             self._camera_info_callback,
-            qos_profile=qos_profile
+            qos_profile=camera_qos
         )
         
         self.create_subscription(
             PointCloud2,
             '/camera/depth/color/points',
             self._point_cloud_callback,
-            qos_profile=qos_profile
+            qos_profile=camera_qos
         )
         
-        # self.create_subscription(
-        #     Odometry,
-        #     '/odom',
-        #     self._odom_callback,
-        #     qos_profile=qos_profile
-        # )
+        self.create_subscription(
+            Odometry,
+            '/odom',
+            self._odom_callback,
+            qos_profile=odom_qos
+        )
         
-        # self.create_subscription(
-        #     JointState,
-        #     # '/stretch/joint_states',
-        #     '/joint_states',
-        #     self._joint_states_callback,
-        #     qos_profile=qos_profile
-        # )
+        self.create_subscription(
+            JointState,
+            '/stretch/joint_states',
+            # '/joint_states',
+            self._joint_states_callback,
+            qos_profile=joint_qos
+        )
 
-        self._odom_subs = self._subscribe_state_topic_dual_qos(
-            Odometry, '/odom', self._odom_callback
-        )
-        self._joints_subs = self._subscribe_state_topic_dual_qos(
-            JointState, '/joint_states', self._joint_states_callback
-        )
+        self.get_logger().info("Subscription Summary:")
+        topics = [
+            '/camera/color/image_raw',
+            '/camera/depth/image_rect_raw',
+            '/camera/color/camera_info',
+            '/camera/depth/color/points',
+            '/odom',
+            '/joint_states'
+        ]
+        for topic in topics:
+            self.get_logger().info(f"{topic}: {self.count_subscribers(topic)} subscribers")
+        # breakpoint()
+        # self._odom_subs = self._subscribe_state_topic_dual_qos(
+        #     Odometry, '/odom', self._odom_callback
+        # )
+        # self._joints_subs = self._subscribe_state_topic_dual_qos(
+        #     JointState, '/joint_states', self._joint_states_callback
+        # )
         self._got_first_odom = False
         self._got_first_joints = False
 
@@ -266,6 +295,7 @@ class DynaMemROS2Client(AbstractRobotClient, Node):
 
         if self._rerun:
             self._rerun_thread = threading.Thread(target=self.blocking_spin_rerun, daemon=True)
+
             self._rerun_thread.start()
 
         # Wait up to 10s for first obs+state
@@ -365,6 +395,7 @@ class DynaMemROS2Client(AbstractRobotClient, Node):
             if rgb is not None and depth is not None and xyz is not None:
                 obs = {'rgb': rgb, 'depth': depth, 'xyz': xyz, 'camera_K': K}
                 try:
+                    print("rerun step")
                     self._rerun.step(obs, None)
                 except Exception as e:
                     self.get_logger().error(f"Error in rerun visualization: {str(e)}")
@@ -629,7 +660,7 @@ class DynaMemROS2Client(AbstractRobotClient, Node):
             obs.camera_K = self._current_camera_info['K'] if self._current_camera_info else None
         
             # Do TF lookup OUTSIDE the lock
-            cam_T = self._lookup_tf_matrix("/odom", "/camera_color_frame", timeout_sec=0.5)
+            cam_T = self._lookup_tf_matrix("odom", "camera_color_frame", timeout_sec=0.5)
             obs.camera_pose = cam_T  # 4x4 np.ndarray or None if not available
 
             return obs
@@ -766,8 +797,33 @@ class DynaMemROS2Client(AbstractRobotClient, Node):
         except Exception as e:
             self.get_logger().error(f"Error processing point cloud: {str(e)}")
 
+    def _odom_callback(self, msg: Odometry):
+        try:
+            print(f"Raw Odom Received! Position: {msg.pose.pose.position}")  # Immediate verification
+            pose = msg.pose.pose
+            yaw = self._quaternion_to_yaw(pose.orientation)
+            # with self._state_lock:  # Temporarily remove this for testing
+            self._current_pose = {
+                'position': [pose.position.x, pose.position.y, pose.position.z],
+                'orientation': [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w],
+                'yaw': yaw
+            }
+            print(f"Processed Odom: {self._current_pose}")  # Verify processing
+        except Exception as e:
+            print(f"Odom callback error: {e}")
+
+    def _joint_states_callback(self, msg: JointState):
+        try:
+            print(f"Raw Joint States Received! Names: {msg.name} Positions: {msg.position}")
+            # with self._state_lock:  # Temporarily remove this for testing
+            self._current_joints = np.array(msg.position)
+            print(f"Processed Joints: {self._current_joints}")
+        except Exception as e:
+            print(f"Joint states callback error: {e}")
+
     # def _odom_callback(self, msg: Odometry):
     #     pose = msg.pose.pose
+    #     print("odom callback: ", pose)
     #     yaw = self._quaternion_to_yaw(pose.orientation)
     #     with self._state_lock:
     #         self._current_pose = {
@@ -788,38 +844,40 @@ class DynaMemROS2Client(AbstractRobotClient, Node):
     #     self.tf_broadcaster.sendTransform(t)
 
     # def _joint_states_callback(self, msg: JointState):
+    #     position = msg.position
+    #     print("joint states callback: ", position)
+    #     with self._state_lock:
+    #         self._current_joints = np.array(position)
+
+    # def _odom_callback(self, msg: Odometry):
+    #     if not self._got_first_odom:
+    #         self.get_logger().info("[startup] got first /odom")
+    #         self._got_first_odom = True
+    #     pose = msg.pose.pose
+    #     yaw = self._quaternion_to_yaw(pose.orientation)
+    #     with self._state_lock:
+    #         self._current_pose = {
+    #             'position': [pose.position.x, pose.position.y, pose.position.z],
+    #             'orientation': [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w],
+    #             'yaw': yaw
+    #         }
+    #     # Publish TF (as you had)
+    #     t = TransformStamped()
+    #     t.header.stamp = self.get_clock().now().to_msg()
+    #     t.header.frame_id = 'odom'
+    #     t.child_frame_id = 'base_link'
+    #     t.transform.translation.x = pose.position.x
+    #     t.transform.translation.y = pose.position.y
+    #     t.transform.translation.z = pose.position.z
+    #     t.transform.rotation = pose.orientation
+    #     self.tf_broadcaster.sendTransform(t)
+
+    # def _joint_states_callback(self, msg: JointState):
+    #     if not self._got_first_joints:
+    #         self.get_logger().info("[startup] got first /joint_states")
+    #         self._got_first_joints = True
     #     with self._state_lock:
     #         self._current_joints = np.array(msg.position)
-
-    def _odom_callback(self, msg: Odometry):
-        if not self._got_first_odom:
-            self.get_logger().info("[startup] got first /odom")
-            self._got_first_odom = True
-        pose = msg.pose.pose
-        yaw = self._quaternion_to_yaw(pose.orientation)
-        with self._state_lock:
-            self._current_pose = {
-                'position': [pose.position.x, pose.position.y, pose.position.z],
-                'orientation': [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w],
-                'yaw': yaw
-            }
-        # Publish TF (as you had)
-        t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'odom'
-        t.child_frame_id = 'base_link'
-        t.transform.translation.x = pose.position.x
-        t.transform.translation.y = pose.position.y
-        t.transform.translation.z = pose.position.z
-        t.transform.rotation = pose.orientation
-        self.tf_broadcaster.sendTransform(t)
-
-    def _joint_states_callback(self, msg: JointState):
-        if not self._got_first_joints:
-            self.get_logger().info("[startup] got first /joint_states")
-            self._got_first_joints = True
-        with self._state_lock:
-            self._current_joints = np.array(msg.position)
 
 
 
